@@ -33,6 +33,9 @@ paste a script into an interactive PowerShell window.
 | `-PollInterval`          | Seconds between window polls. Default `1.0`. Pulsetime is `PollInterval+1`. |
 | `-BucketId`              | Override the bucket id (default: `aw-watcher-window_<hostname>`).           |
 | `-SkipCertificateCheck`  | Skip server certificate validation. PowerShell 6+ only.                     |
+| `-NoProxy`               | Bypass any configured system / WPAD proxy and connect directly.             |
+| `-ProxyUseDefaultCredentials` | Authenticate to the system proxy with current Windows credentials.     |
+| `-ProxyCredential`       | `PSCredential` with explicit username/password for the proxy.               |
 
 ## mTLS example
 
@@ -46,6 +49,27 @@ Start-AwWatcherWindow `
     -CertificatePath C:\certs\me.pfx `
     -CertificatePassword $pw
 ```
+
+## Behind a corporate proxy
+
+If your PowerShell session sits behind an HTTP proxy that intercepts traffic
+to the AW server (you'll see `HTTP 407 Proxy Authentication Required`), pick
+one of:
+
+```powershell
+# Skip the proxy entirely — use when the AW server is reachable directly.
+Start-AwWatcherWindow -Url https://aw.example.com -NoProxy
+
+# Authenticate to the proxy with your current Windows login (NTLM/Kerberos).
+Start-AwWatcherWindow -Url https://aw.example.com -ProxyUseDefaultCredentials
+
+# Authenticate with an explicit username/password.
+$cred = Get-Credential
+Start-AwWatcherWindow -Url https://aw.example.com -ProxyCredential $cred
+```
+
+On Windows PowerShell 5.1, `-NoProxy` is emulated by temporarily clearing the
+session's default proxy and restoring it when the watcher stops.
 
 ## Verifying it works
 

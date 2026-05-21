@@ -6,9 +6,12 @@
 #                         [-CertificatePath <path>] [-CertificatePassword <SecureString>]
 #                         [-PollInterval <seconds>] [-BucketId <string>]
 #                         [-SkipCertificateCheck]
+#                         [-NoProxy] [-ProxyUseDefaultCredentials] [-ProxyCredential <PSCredential>]
 #
 # Examples:
 #   Start-AwWatcherWindow -Url http://localhost:5600
+#   Start-AwWatcherWindow -Url https://aw.example.com -NoProxy
+#   Start-AwWatcherWindow -Url https://aw.example.com -ProxyUseDefaultCredentials
 #   Start-AwWatcherWindow -Url https://aw.example.com -CertificatePath C:\certs\me.pfx
 #   $pw = Read-Host -AsSecureString "PFX password"
 #   Start-AwWatcherWindow -Url https://aw.example.com -CertificatePath .\me.pfx -CertificatePassword $pw
@@ -54,10 +57,23 @@ function Start-AwWatcherWindow {
         [string] $BucketId,
 
         [Parameter()]
-        [switch] $SkipCertificateCheck
+        [switch] $SkipCertificateCheck,
+
+        [Parameter()]
+        [switch] $NoProxy,
+
+        [Parameter()]
+        [switch] $ProxyUseDefaultCredentials,
+
+        [Parameter()]
+        [System.Management.Automation.PSCredential] $ProxyCredential
     )
 
     $ErrorActionPreference = 'Stop'
+
+    if ($NoProxy -and ($ProxyUseDefaultCredentials -or $ProxyCredential)) {
+        throw '-NoProxy cannot be combined with -ProxyUseDefaultCredentials or -ProxyCredential.'
+    }
 
     $baseUrl = $Url.TrimEnd('/')
     $hostname = [System.Net.Dns]::GetHostName().ToLowerInvariant()
@@ -93,6 +109,18 @@ function Start-AwWatcherWindow {
     }
     if ($certificate) { $commonArgs.Certificate = $certificate }
     if ($SkipCertificateCheck -and $isCore) { $commonArgs.SkipCertificateCheck = $true }
+    if ($NoProxy -and $isCore) { $commonArgs.NoProxy = $true }
+    if ($ProxyUseDefaultCredentials) { $commonArgs.ProxyUseDefaultCredentials = $true }
+    if ($ProxyCredential) { $commonArgs.ProxyCredential = $ProxyCredential }
+
+    $savedProxy = $null
+    $proxyOverridden = $false
+    if ($NoProxy -and -not $isCore) {
+        $savedProxy = [System.Net.WebRequest]::DefaultWebProxy
+        [System.Net.WebRequest]::DefaultWebProxy = New-Object System.Net.WebProxy
+        $proxyOverridden = $true
+        Write-Host 'System proxy disabled for this session (Windows PowerShell 5.1 emulation of -NoProxy).'
+    }
 
     function Invoke-AwRequest {
         param([string] $Method, [string] $Uri, [string] $Body)
@@ -110,6 +138,7 @@ function Start-AwWatcherWindow {
         type     = 'currentwindow'
     } | ConvertTo-Json -Compress
 
+    try {
     $attempt = 0
     while ($true) {
         try {
@@ -178,6 +207,13 @@ function Start-AwWatcherWindow {
         }
 
         Start-Sleep -Seconds $PollInterval
+    }
+    }
+    finally {
+        if ($proxyOverridden) {
+            [System.Net.WebRequest]::DefaultWebProxy = $savedProxy
+            Write-Host 'Restored original system proxy.'
+        }
     }
 }
 
