@@ -6,12 +6,13 @@
 #                         [-CertificatePath <path>] [-CertificatePassword <SecureString>]
 #                         [-PollInterval <seconds>] [-BucketId <string>]
 #                         [-SkipCertificateCheck]
-#                         [-NoProxy] [-ProxyUseDefaultCredentials] [-ProxyCredential <PSCredential>]
+#                         [-NoProxy] [-Proxy <uri>] [-ProxyUseDefaultCredentials] [-ProxyCredential <PSCredential>]
 #
 # Examples:
 #   Start-AwWatcherWindow -Url http://localhost:5600
 #   Start-AwWatcherWindow -Url https://aw.example.com -NoProxy
 #   Start-AwWatcherWindow -Url https://aw.example.com -ProxyUseDefaultCredentials
+#   Start-AwWatcherWindow -Url https://aw.example.com -Proxy http://proxy.corp:8080 -ProxyCredential (Get-Credential)
 #   Start-AwWatcherWindow -Url https://aw.example.com -CertificatePath C:\certs\me.pfx
 #   $pw = Read-Host -AsSecureString "PFX password"
 #   Start-AwWatcherWindow -Url https://aw.example.com -CertificatePath .\me.pfx -CertificatePassword $pw
@@ -63,6 +64,9 @@ function Start-AwWatcherWindow {
         [switch] $NoProxy,
 
         [Parameter()]
+        [string] $Proxy,
+
+        [Parameter()]
         [switch] $ProxyUseDefaultCredentials,
 
         [Parameter()]
@@ -71,8 +75,8 @@ function Start-AwWatcherWindow {
 
     $ErrorActionPreference = 'Stop'
 
-    if ($NoProxy -and ($ProxyUseDefaultCredentials -or $ProxyCredential)) {
-        throw '-NoProxy cannot be combined with -ProxyUseDefaultCredentials or -ProxyCredential.'
+    if ($NoProxy -and ($ProxyUseDefaultCredentials -or $ProxyCredential -or $Proxy)) {
+        throw '-NoProxy cannot be combined with -Proxy, -ProxyUseDefaultCredentials, or -ProxyCredential.'
     }
 
     $baseUrl = $Url.TrimEnd('/')
@@ -110,8 +114,30 @@ function Start-AwWatcherWindow {
     if ($certificate) { $commonArgs.Certificate = $certificate }
     if ($SkipCertificateCheck -and $isCore) { $commonArgs.SkipCertificateCheck = $true }
     if ($NoProxy -and $isCore) { $commonArgs.NoProxy = $true }
-    if ($ProxyUseDefaultCredentials) { $commonArgs.ProxyUseDefaultCredentials = $true }
-    if ($ProxyCredential) { $commonArgs.ProxyCredential = $ProxyCredential }
+
+    if ($ProxyUseDefaultCredentials -or $ProxyCredential -or $Proxy) {
+        $proxyUri = $Proxy
+        if (-not $proxyUri) {
+            try {
+                $sysProxy = [System.Net.WebRequest]::DefaultWebProxy
+                if ($sysProxy) {
+                    $candidate = $sysProxy.GetProxy([Uri] $baseUrl)
+                    if ($candidate -and $candidate.AbsoluteUri -ne ([Uri] $baseUrl).AbsoluteUri) {
+                        $proxyUri = $candidate.AbsoluteUri
+                    }
+                }
+            } catch {
+                # fall through; we'll throw below
+            }
+        }
+        if (-not $proxyUri) {
+            throw 'Could not detect a system proxy. Pass -Proxy <uri> explicitly (e.g. -Proxy http://proxy.corp:8080).'
+        }
+        $commonArgs.Proxy = $proxyUri
+        Write-Host "Using proxy: $proxyUri"
+        if ($ProxyUseDefaultCredentials) { $commonArgs.ProxyUseDefaultCredentials = $true }
+        if ($ProxyCredential)            { $commonArgs.ProxyCredential = $ProxyCredential }
+    }
 
     $savedProxy = $null
     $proxyOverridden = $false

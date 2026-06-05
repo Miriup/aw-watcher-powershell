@@ -34,6 +34,7 @@ paste a script into an interactive PowerShell window.
 | `-BucketId`              | Override the bucket id (default: `aw-watcher-window_<hostname>`).           |
 | `-SkipCertificateCheck`  | Skip server certificate validation. PowerShell 6+ only.                     |
 | `-NoProxy`               | Bypass any configured system / WPAD proxy and connect directly.             |
+| `-Proxy`                 | Explicit proxy URI (e.g. `http://proxy.corp:8080`). Auto-detected if omitted when proxy creds are given. |
 | `-ProxyUseDefaultCredentials` | Authenticate to the system proxy with current Windows credentials.     |
 | `-ProxyCredential`       | `PSCredential` with explicit username/password for the proxy.               |
 
@@ -66,7 +67,14 @@ Start-AwWatcherWindow -Url https://aw.example.com -ProxyUseDefaultCredentials
 # Authenticate with an explicit username/password.
 $cred = Get-Credential
 Start-AwWatcherWindow -Url https://aw.example.com -ProxyCredential $cred
+
+# If the proxy can't be auto-detected, give the URL explicitly:
+Start-AwWatcherWindow -Url https://aw.example.com -Proxy http://proxy.corp:8080 -ProxyUseDefaultCredentials
 ```
+
+Windows PowerShell 5.1 requires an explicit `-Proxy` URL when proxy
+credentials are used; the watcher tries to read it from the system settings
+automatically, and surfaces a clear error if it can't.
 
 On Windows PowerShell 5.1, `-NoProxy` is emulated by temporarily clearing the
 session's default proxy and restoring it when the watcher stops.
