@@ -155,6 +155,79 @@ function Start-AwWatcherWindow {
         Invoke-RestMethod @params
     }
 
+    function Format-AwHttpError {
+        param(
+            [Parameter(Mandatory)] $ErrorRecord,
+            [string] $Method,
+            [string] $Uri,
+            [string] $ProxyUri
+        )
+
+        $lines = @()
+        $lines += "$Method $Uri failed."
+        if ($ProxyUri) { $lines += "  Proxy: $ProxyUri" }
+
+        $ex = $ErrorRecord.Exception
+        if ($ex) {
+            $lines += "  Exception: $($ex.GetType().FullName)"
+            $lines += "  Message:   $($ex.Message)"
+        }
+
+        $response = $null
+        if ($ex) { try { $response = $ex.Response } catch {} }
+        if ($response) {
+            $status = $null; $reason = $null
+            try { $status = [int]$response.StatusCode } catch {}
+            try { $reason = $response.ReasonPhrase } catch {}
+            if (-not $reason) { try { $reason = $response.StatusDescription } catch {} }
+            if ($status) { $lines += "  Status:    $status $reason" }
+
+            $headersOfInterest = 'Via','X-Cache','X-Cache-Lookup','X-Squid-Error','Proxy-Authenticate','WWW-Authenticate','Server','X-Forwarded-For','X-Proxy-Error','X-Error-Message'
+            $headerLines = @()
+            foreach ($name in $headersOfInterest) {
+                $value = $null
+                try {
+                    if ($response.Headers -is [System.Net.WebHeaderCollection]) {
+                        $value = $response.Headers[$name]
+                    } elseif ($response.Headers) {
+                        $vals = $null
+                        if ($response.Headers.TryGetValues($name, [ref] $vals)) {
+                            $value = ($vals -join ', ')
+                        }
+                    }
+                } catch {}
+                if ($value) { $headerLines += "    ${name}: $value" }
+            }
+            if ($headerLines.Count -gt 0) {
+                $lines += '  Response headers:'
+                $lines += $headerLines
+            }
+        }
+
+        $body = $null
+        if ($ErrorRecord.ErrorDetails -and $ErrorRecord.ErrorDetails.Message) {
+            # PowerShell 7+ places the response body here.
+            $body = $ErrorRecord.ErrorDetails.Message
+        } elseif ($response) {
+            # Windows PowerShell 5.1: read the body from the response stream.
+            try {
+                $stream = $response.GetResponseStream()
+                if ($stream) {
+                    $reader = New-Object System.IO.StreamReader($stream)
+                    try { $body = $reader.ReadToEnd() } finally { $reader.Dispose() }
+                }
+            } catch {}
+        }
+        if ($body) {
+            $trimmed = $body.Trim()
+            if ($trimmed.Length -gt 1000) { $trimmed = $trimmed.Substring(0, 1000) + '... [truncated]' }
+            $lines += '  Response body:'
+            foreach ($line in ($trimmed -split "`r?`n")) { $lines += "    $line" }
+        }
+
+        return ($lines -join "`n")
+    }
+
     $bucketUrl = "$baseUrl/api/0/buckets/$BucketId"
     $heartbeatUrl = "$bucketUrl/heartbeat?pulsetime=$pulseTime"
 
@@ -173,14 +246,15 @@ function Start-AwWatcherWindow {
             break
         } catch {
             $status = $null
-            if ($_.Exception.Response) { $status = [int]$_.Exception.Response.StatusCode }
+            if ($_.Exception.Response) { try { $status = [int]$_.Exception.Response.StatusCode } catch {} }
             if ($status -eq 304 -or $status -eq 200 -or $status -eq 201) {
                 Write-Host "Bucket already exists: $BucketId"
                 break
             }
             $attempt++
             $delay = [Math]::Min(30, [Math]::Pow(2, [Math]::Min($attempt, 5)))
-            Write-Warning "Bucket creation failed (status=$status): $($_.Exception.Message). Retrying in ${delay}s..."
+            Write-Warning (Format-AwHttpError -ErrorRecord $_ -Method 'POST' -Uri $bucketUrl -ProxyUri $commonArgs.Proxy)
+            Write-Warning "Retrying bucket creation in ${delay}s (attempt $attempt)..."
             if ($attempt -ge 5) {
                 Write-Warning 'Giving up on bucket creation for now; heartbeats may still recover the bucket if the server comes online.'
                 break
@@ -227,9 +301,7 @@ function Start-AwWatcherWindow {
         try {
             Invoke-AwRequest -Method Post -Uri $heartbeatUrl -Body $event | Out-Null
         } catch {
-            $status = $null
-            if ($_.Exception.Response) { $status = [int]$_.Exception.Response.StatusCode }
-            Write-Warning "Heartbeat failed (status=$status): $($_.Exception.Message)"
+            Write-Warning (Format-AwHttpError -ErrorRecord $_ -Method 'POST' -Uri $heartbeatUrl -ProxyUri $commonArgs.Proxy)
         }
 
         Start-Sleep -Seconds $PollInterval
