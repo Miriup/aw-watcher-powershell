@@ -83,7 +83,8 @@ function Start-AwWatcherWindow {
     $hostname = [System.Net.Dns]::GetHostName().ToLowerInvariant()
     if (-not $BucketId) { $BucketId = "aw-watcher-window_$hostname" }
     $clientName = 'aw-watcher-window-powershell'
-    $pulseTime = $PollInterval + 1.0
+    # Format invariantly so a comma decimal separator never reaches the query string.
+    $pulseTime = ($PollInterval + 1.0).ToString([System.Globalization.CultureInfo]::InvariantCulture)
 
     $certificate = $null
     if ($CertificatePath) {
@@ -107,7 +108,7 @@ function Start-AwWatcherWindow {
     }
 
     $commonArgs = @{
-        ContentType = 'application/json'
+        ContentType = 'application/json; charset=utf-8'
         TimeoutSec  = 10
         UseBasicParsing = $true
     }
@@ -151,7 +152,10 @@ function Start-AwWatcherWindow {
     function Invoke-AwRequest {
         param([string] $Method, [string] $Uri, [string] $Body)
         $params = @{ Method = $Method; Uri = $Uri } + $commonArgs
-        if ($Body) { $params.Body = $Body }
+        # Encode to UTF-8 bytes ourselves: Windows PowerShell 5.1 sends string
+        # bodies as Latin-1, which the server rejects as invalid UTF-8 as soon
+        # as a window title contains a non-ASCII character.
+        if ($Body) { $params.Body = [System.Text.Encoding]::UTF8.GetBytes($Body) }
         Invoke-RestMethod @params
     }
 
@@ -218,14 +222,16 @@ function Start-AwWatcherWindow {
             Write-Warning "Failed to read foreground window: $($_.Exception.Message)"
         }
 
-        $event = @{
-            timestamp = [DateTime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ss.fffffffZ')
+        $heartbeat = @{
+            # 'o' is the culture-invariant round-trip format and yields the
+            # trailing 'Z' because UtcNow has Kind=Utc.
+            timestamp = [DateTime]::UtcNow.ToString('o', [System.Globalization.CultureInfo]::InvariantCulture)
             duration  = 0
             data      = @{ app = $app; title = $title }
         } | ConvertTo-Json -Compress
 
         try {
-            Invoke-AwRequest -Method Post -Uri $heartbeatUrl -Body $event | Out-Null
+            Invoke-AwRequest -Method Post -Uri $heartbeatUrl -Body $heartbeat | Out-Null
         } catch {
             $status = $null
             if ($_.Exception.Response) { $status = [int]$_.Exception.Response.StatusCode }
