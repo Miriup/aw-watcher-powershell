@@ -1,4 +1,4 @@
-# aw-watcher-window for PowerShell
+# aw-watcher for PowerShell
 #
 # Paste this whole script into a PowerShell window. It defines one function:
 #
@@ -19,6 +19,11 @@
 #
 # Press Ctrl+C to stop the watcher.
 
+# NOTE: .NET types cannot be replaced once loaded, and the catch below deliberately
+# swallows the "already exists" error so re-pasting the script is harmless. The
+# consequence is that MEMBERS MUST NEVER BE ADDED TO AN ALREADY-PUBLISHED CLASS:
+# a console that pasted an older version would silently keep the old class and the
+# new members would be missing at call time. Introduce a new class name instead.
 try {
     Add-Type -Namespace AwWatcher -Name Win32 -MemberDefinition @'
         [System.Runtime.InteropServices.DllImport("user32.dll")]
@@ -39,7 +44,36 @@ try {
     }
 }
 
-function Start-AwWatcherWindow {
+function Format-AwInvariant {
+    # Every number that reaches a query string goes through here. A bare
+    # $Value.ToString() is culture-sensitive and yields "2,5" under e.g. de-DE,
+    # which the server rejects as a pulsetime; the explicit format provider is
+    # what prevents that.
+    param([double] $Value)
+    return $Value.ToString([System.Globalization.CultureInfo]::InvariantCulture)
+}
+
+function Select-AwConnectionArgs {
+    # Narrows a caller's $PSBoundParameters down to the connection parameters, so
+    # an entry point can splat into New-AwWatcherContext without its own
+    # watcher-specific parameters causing a "cannot find parameter" error.
+    param([System.Collections.IDictionary] $Bound)
+
+    $keys = @(
+        'Url', 'CertificatePath', 'CertificatePassword', 'SkipCertificateCheck',
+        'NoProxy', 'Proxy', 'ProxyUseDefaultCredentials', 'ProxyCredential'
+    )
+    $selected = @{}
+    foreach ($key in $keys) {
+        # ContainsKey, not Contains: $PSBoundParameters is a generic dictionary
+        # that implements IDictionary.Contains only explicitly, so PowerShell
+        # cannot see it.
+        if ($Bound.ContainsKey($key)) { $selected[$key] = $Bound[$key] }
+    }
+    return $selected
+}
+
+function New-AwWatcherContext {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory = $true)]
@@ -50,12 +84,6 @@ function Start-AwWatcherWindow {
 
         [Parameter()]
         [System.Security.SecureString] $CertificatePassword,
-
-        [Parameter()]
-        [double] $PollInterval = 1.0,
-
-        [Parameter()]
-        [string] $BucketId,
 
         [Parameter()]
         [switch] $SkipCertificateCheck,
@@ -81,10 +109,6 @@ function Start-AwWatcherWindow {
 
     $baseUrl = $Url.TrimEnd('/')
     $hostname = [System.Net.Dns]::GetHostName().ToLowerInvariant()
-    if (-not $BucketId) { $BucketId = "aw-watcher-window_$hostname" }
-    $clientName = 'aw-watcher-window-powershell'
-    # Format invariantly so a comma decimal separator never reaches the query string.
-    $pulseTime = ($PollInterval + 1.0).ToString([System.Globalization.CultureInfo]::InvariantCulture)
 
     $certificate = $null
     if ($CertificatePath) {
@@ -140,112 +164,234 @@ function Start-AwWatcherWindow {
         if ($ProxyCredential)            { $commonArgs.ProxyCredential = $ProxyCredential }
     }
 
-    $savedProxy = $null
-    $proxyOverridden = $false
+    $context = @{
+        BaseUrl         = $baseUrl
+        Hostname        = $hostname
+        IsCore          = $isCore
+        CommonArgs      = $commonArgs
+        SavedProxy      = $null
+        ProxyOverridden = $false
+    }
+
+    # Replacing DefaultWebProxy is a process-wide side effect, and it happens
+    # before the caller's try/finally exists. Keep it as the last thing this
+    # function does, so nothing that could throw runs between the override and
+    # the caller taking responsibility for restoring it.
     if ($NoProxy -and -not $isCore) {
-        $savedProxy = [System.Net.WebRequest]::DefaultWebProxy
+        $context.SavedProxy = [System.Net.WebRequest]::DefaultWebProxy
         [System.Net.WebRequest]::DefaultWebProxy = New-Object System.Net.WebProxy
-        $proxyOverridden = $true
+        $context.ProxyOverridden = $true
         Write-Host 'System proxy disabled for this session (Windows PowerShell 5.1 emulation of -NoProxy).'
     }
 
-    function Invoke-AwRequest {
-        param([string] $Method, [string] $Uri, [string] $Body)
-        $params = @{ Method = $Method; Uri = $Uri } + $commonArgs
-        # Encode to UTF-8 bytes ourselves: Windows PowerShell 5.1 sends string
-        # bodies as Latin-1, which the server rejects as invalid UTF-8 as soon
-        # as a window title contains a non-ASCII character.
-        if ($Body) { $params.Body = [System.Text.Encoding]::UTF8.GetBytes($Body) }
-        Invoke-RestMethod @params
+    return $context
+}
+
+function Close-AwWatcherContext {
+    # Idempotent: Ctrl+C unwinding can re-enter this, and calling it twice must
+    # not clobber the proxy a second time.
+    param([hashtable] $Context)
+
+    if ($Context -and $Context.ProxyOverridden) {
+        [System.Net.WebRequest]::DefaultWebProxy = $Context.SavedProxy
+        $Context.ProxyOverridden = $false
+        Write-Host 'Restored original system proxy.'
     }
+}
 
-    $bucketUrl = "$baseUrl/api/0/buckets/$BucketId"
-    $heartbeatUrl = "$bucketUrl/heartbeat?pulsetime=$pulseTime"
+function Invoke-AwRequest {
+    # $Context is passed explicitly rather than resolved from the caller's scope:
+    # PowerShell looks free variables up dynamically, so relying on that would
+    # work by accident and break silently when called from anywhere else.
+    param([hashtable] $Context, [string] $Method, [string] $Uri, [string] $Body)
 
+    $params = @{ Method = $Method; Uri = $Uri } + $Context.CommonArgs
+    # Encode to UTF-8 bytes ourselves: Windows PowerShell 5.1 sends string
+    # bodies as Latin-1, which the server rejects as invalid UTF-8 as soon
+    # as a window title contains a non-ASCII character.
+    if ($Body) { $params.Body = [System.Text.Encoding]::UTF8.GetBytes($Body) }
+    Invoke-RestMethod @params
+}
+
+function Initialize-AwBucket {
+    param([hashtable] $Context, [string] $BucketId, [string] $Type, [string] $Client)
+
+    $bucketUrl = "$($Context.BaseUrl)/api/0/buckets/$BucketId"
     $bucketBody = @{
-        client   = $clientName
-        hostname = $hostname
-        type     = 'currentwindow'
+        client   = $Client
+        hostname = $Context.Hostname
+        type     = $Type
     } | ConvertTo-Json -Compress
 
-    try {
     $attempt = 0
     while ($true) {
         try {
-            Invoke-AwRequest -Method Post -Uri $bucketUrl -Body $bucketBody | Out-Null
-            Write-Host "Bucket ready: $BucketId at $baseUrl"
-            break
+            Invoke-AwRequest -Context $Context -Method Post -Uri $bucketUrl -Body $bucketBody | Out-Null
+            Write-Host "Bucket ready: $BucketId at $($Context.BaseUrl)"
+            return
         } catch {
             $status = $null
             if ($_.Exception.Response) { $status = [int]$_.Exception.Response.StatusCode }
             if ($status -eq 304 -or $status -eq 200 -or $status -eq 201) {
                 Write-Host "Bucket already exists: $BucketId"
-                break
+                return
             }
             $attempt++
             $delay = [Math]::Min(30, [Math]::Pow(2, [Math]::Min($attempt, 5)))
             Write-Warning "Bucket creation failed (status=$status): $($_.Exception.Message). Retrying in ${delay}s..."
             if ($attempt -ge 5) {
                 Write-Warning 'Giving up on bucket creation for now; heartbeats may still recover the bucket if the server comes online.'
-                break
+                return
             }
             Start-Sleep -Seconds $delay
         }
     }
+}
 
-    Write-Host "Watching active window. Press Ctrl+C to stop."
+function Send-AwHeartbeat {
+    # The single place a heartbeat is formatted and sent. Never throws.
+    param(
+        [hashtable] $Context,
+        [string] $BucketId,
+        [string] $PulseTime,
+        [DateTime] $Timestamp,
+        [double] $Duration,
+        [hashtable] $Data,
+        [string] $Label
+    )
 
-    while ($true) {
-        $app = 'unknown'
-        $title = 'unknown'
-        try {
-            $hwnd = [AwWatcher.Win32]::GetForegroundWindow()
-            if ($hwnd -ne [System.IntPtr]::Zero) {
-                $len = [AwWatcher.Win32]::GetWindowTextLength($hwnd)
-                if ($len -gt 0) {
-                    $sb = New-Object System.Text.StringBuilder ($len + 1)
-                    [void][AwWatcher.Win32]::GetWindowText($hwnd, $sb, $sb.Capacity)
-                    $title = $sb.ToString()
-                }
-                $procId = 0
-                [void][AwWatcher.Win32]::GetWindowThreadProcessId($hwnd, [ref] $procId)
-                if ($procId -ne 0) {
-                    try {
-                        $proc = Get-Process -Id $procId -ErrorAction Stop
-                        if ($proc.ProcessName) { $app = $proc.ProcessName }
-                    } catch {
-                        # process exited between calls; keep 'unknown'
-                    }
+    # ConvertTo-Json's default -Depth of 2 exactly covers this shape. A raw
+    # [DateTime] here would serialise as "\/Date(...)\/" on Windows PowerShell
+    # 5.1, hence the pre-formatted string.
+    $body = @{
+        # 'o' is the culture-invariant round-trip format and yields the
+        # trailing 'Z' because the timestamp has Kind=Utc.
+        timestamp = $Timestamp.ToString('o', [System.Globalization.CultureInfo]::InvariantCulture)
+        duration  = [Math]::Round($Duration, 3)
+        data      = $Data
+    } | ConvertTo-Json -Compress
+
+    $uri = "$($Context.BaseUrl)/api/0/buckets/$BucketId/heartbeat?pulsetime=$PulseTime"
+    try {
+        Invoke-AwRequest -Context $Context -Method Post -Uri $uri -Body $body | Out-Null
+    } catch {
+        $status = $null
+        if ($_.Exception.Response) { $status = [int]$_.Exception.Response.StatusCode }
+        Write-Warning "$Label heartbeat failed (status=$status): $($_.Exception.Message)"
+    }
+}
+
+function Get-AwWindowEvent {
+    # Never throws; falls back to 'unknown' so the loop keeps reporting.
+    $app = 'unknown'
+    $title = 'unknown'
+    try {
+        $hwnd = [AwWatcher.Win32]::GetForegroundWindow()
+        if ($hwnd -ne [System.IntPtr]::Zero) {
+            $len = [AwWatcher.Win32]::GetWindowTextLength($hwnd)
+            if ($len -gt 0) {
+                $sb = New-Object System.Text.StringBuilder ($len + 1)
+                [void][AwWatcher.Win32]::GetWindowText($hwnd, $sb, $sb.Capacity)
+                $title = $sb.ToString()
+            }
+            $procId = 0
+            [void][AwWatcher.Win32]::GetWindowThreadProcessId($hwnd, [ref] $procId)
+            if ($procId -ne 0) {
+                try {
+                    $proc = Get-Process -Id $procId -ErrorAction Stop
+                    if ($proc.ProcessName) { $app = $proc.ProcessName }
+                } catch {
+                    # process exited between calls; keep 'unknown'
                 }
             }
-        } catch {
-            Write-Warning "Failed to read foreground window: $($_.Exception.Message)"
         }
-
-        $heartbeat = @{
-            # 'o' is the culture-invariant round-trip format and yields the
-            # trailing 'Z' because UtcNow has Kind=Utc.
-            timestamp = [DateTime]::UtcNow.ToString('o', [System.Globalization.CultureInfo]::InvariantCulture)
-            duration  = 0
-            data      = @{ app = $app; title = $title }
-        } | ConvertTo-Json -Compress
-
-        try {
-            Invoke-AwRequest -Method Post -Uri $heartbeatUrl -Body $heartbeat | Out-Null
-        } catch {
-            $status = $null
-            if ($_.Exception.Response) { $status = [int]$_.Exception.Response.StatusCode }
-            Write-Warning "Heartbeat failed (status=$status): $($_.Exception.Message)"
-        }
-
-        Start-Sleep -Seconds $PollInterval
+    } catch {
+        Write-Warning "Failed to read foreground window: $($_.Exception.Message)"
     }
+
+    return @{ app = $app; title = $title }
+}
+
+function Invoke-AwWindowTick {
+    param([hashtable] $Context, [hashtable] $Window)
+
+    $data = Get-AwWindowEvent
+    Send-AwHeartbeat -Context $Context -BucketId $Window.BucketId -PulseTime $Window.PulseTime `
+        -Timestamp ([DateTime]::UtcNow) -Duration 0 -Data $data -Label 'Window'
+}
+
+function Invoke-AwWatcherLoop {
+    # One loop drives every watcher; a $null half of $Plan simply disables it.
+    param([hashtable] $Context, [hashtable] $Plan)
+
+    # Start-Sleep -Seconds takes an [int] on Windows PowerShell 5.1 (only PS 6+
+    # accepts a double), so a fractional interval would silently round -- and
+    # round to zero below 0.5, busy-looping. Sleep in milliseconds instead.
+    $sleepMs = [int][Math]::Max(1, [Math]::Round($Plan.TickInterval * 1000))
+
+    while ($true) {
+        if ($Plan.Window) { Invoke-AwWindowTick -Context $Context -Window $Plan.Window }
+        Start-Sleep -Milliseconds $sleepMs
+    }
+}
+
+function Start-AwWatcherWindow {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string] $Url,
+
+        [Parameter()]
+        [string] $CertificatePath,
+
+        [Parameter()]
+        [System.Security.SecureString] $CertificatePassword,
+
+        [Parameter()]
+        [ValidateRange(0.05, 3600.0)]
+        [double] $PollInterval = 1.0,
+
+        [Parameter()]
+        [string] $BucketId,
+
+        [Parameter()]
+        [switch] $SkipCertificateCheck,
+
+        [Parameter()]
+        [switch] $NoProxy,
+
+        [Parameter()]
+        [string] $Proxy,
+
+        [Parameter()]
+        [switch] $ProxyUseDefaultCredentials,
+
+        [Parameter()]
+        [System.Management.Automation.PSCredential] $ProxyCredential
+    )
+
+    $ErrorActionPreference = 'Stop'
+
+    $connectionArgs = Select-AwConnectionArgs $PSBoundParameters
+    $context = New-AwWatcherContext @connectionArgs
+    try {
+        if (-not $BucketId) { $BucketId = "aw-watcher-window_$($context.Hostname)" }
+        Initialize-AwBucket -Context $context -BucketId $BucketId `
+            -Type 'currentwindow' -Client 'aw-watcher-window-powershell'
+
+        $plan = @{
+            TickInterval = $PollInterval
+            Window       = @{
+                BucketId  = $BucketId
+                PulseTime = Format-AwInvariant ($PollInterval + 1.0)
+            }
+        }
+
+        Write-Host "Watching active window. Press Ctrl+C to stop."
+        Invoke-AwWatcherLoop -Context $context -Plan $plan
     }
     finally {
-        if ($proxyOverridden) {
-            [System.Net.WebRequest]::DefaultWebProxy = $savedProxy
-            Write-Host 'Restored original system proxy.'
-        }
+        Close-AwWatcherContext -Context $context
     }
 }
 
