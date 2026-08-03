@@ -1,23 +1,40 @@
 # aw-watcher for PowerShell
 #
-# Paste this whole script into a PowerShell window. It defines one function:
+# Paste this whole script into a PowerShell window. It defines three functions:
 #
-#   Start-AwWatcherWindow -Url <string>
-#                         [-CertificatePath <path>] [-CertificatePassword <SecureString>]
-#                         [-PollInterval <seconds>] [-BucketId <string>]
-#                         [-SkipCertificateCheck]
-#                         [-NoProxy] [-Proxy <uri>] [-ProxyUseDefaultCredentials] [-ProxyCredential <PSCredential>]
+#   Start-AwWatcher       - active window AND AFK status (start here)
+#   Start-AwWatcherWindow - active window only
+#   Start-AwWatcherAfk    - AFK status only
+#
+# All three accept the same connection parameters:
+#
+#       -Url <string>
+#       [-CertificatePath <path>] [-CertificatePassword <SecureString>]
+#       [-SkipCertificateCheck]
+#       [-NoProxy] [-Proxy <uri>] [-ProxyUseDefaultCredentials] [-ProxyCredential <PSCredential>]
+#
+# plus, where they apply:
+#
+#       [-PollInterval <seconds>] [-BucketId <string>]              window
+#       [-AfkTimeout <seconds>] [-AfkPollInterval <seconds>]        AFK
+#       [-AfkBucketId <string>]                                     AFK
 #
 # Examples:
-#   Start-AwWatcherWindow -Url http://localhost:5600
-#   Start-AwWatcherWindow -Url https://aw.example.com -NoProxy
-#   Start-AwWatcherWindow -Url https://aw.example.com -ProxyUseDefaultCredentials
-#   Start-AwWatcherWindow -Url https://aw.example.com -Proxy http://proxy.corp:8080 -ProxyCredential (Get-Credential)
-#   Start-AwWatcherWindow -Url https://aw.example.com -CertificatePath C:\certs\me.pfx
+#   Start-AwWatcher -Url http://localhost:5600
+#   Start-AwWatcher -Url http://localhost:5600 -AfkTimeout 300
+#   Start-AwWatcherAfk -Url http://localhost:5600 -AfkTimeout 10 -AfkPollInterval 2
+#   Start-AwWatcher -Url https://aw.example.com -NoProxy
+#   Start-AwWatcher -Url https://aw.example.com -ProxyUseDefaultCredentials
+#   Start-AwWatcher -Url https://aw.example.com -Proxy http://proxy.corp:8080 -ProxyCredential (Get-Credential)
+#   Start-AwWatcher -Url https://aw.example.com -CertificatePath C:\certs\me.pfx
 #   $pw = Read-Host -AsSecureString "PFX password"
-#   Start-AwWatcherWindow -Url https://aw.example.com -CertificatePath .\me.pfx -CertificatePassword $pw
+#   Start-AwWatcher -Url https://aw.example.com -CertificatePath .\me.pfx -CertificatePassword $pw
 #
 # Press Ctrl+C to stop the watcher.
+#
+# If you have pasted an older version of this script into the same console,
+# open a FRESH PowerShell window: .NET types cannot be replaced in a live
+# session, and this script loads two of them.
 
 # NOTE: .NET types cannot be replaced once loaded, and the catch below deliberately
 # swallows the "already exists" error so re-pasting the script is harmless. The
@@ -608,4 +625,93 @@ function Start-AwWatcherAfk {
     }
 }
 
-Write-Host "Loaded. Run: Start-AwWatcherWindow -Url http://localhost:5600"
+function Start-AwWatcher {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string] $Url,
+
+        [Parameter()]
+        [string] $CertificatePath,
+
+        [Parameter()]
+        [System.Security.SecureString] $CertificatePassword,
+
+        [Parameter()]
+        [ValidateRange(0.05, 3600.0)]
+        [double] $PollInterval = 1.0,
+
+        [Parameter()]
+        [string] $BucketId,
+
+        [Parameter()]
+        [ValidateRange(1.0, 86400.0)]
+        [double] $AfkTimeout = 180.0,
+
+        [Parameter()]
+        [ValidateRange(0.05, 3600.0)]
+        [double] $AfkPollInterval = 5.0,
+
+        [Parameter()]
+        [string] $AfkBucketId,
+
+        [Parameter()]
+        [switch] $SkipCertificateCheck,
+
+        [Parameter()]
+        [switch] $NoProxy,
+
+        [Parameter()]
+        [string] $Proxy,
+
+        [Parameter()]
+        [switch] $ProxyUseDefaultCredentials,
+
+        [Parameter()]
+        [System.Management.Automation.PSCredential] $ProxyCredential
+    )
+
+    $ErrorActionPreference = 'Stop'
+
+    # The shared loop ticks at the window interval, so the AFK watcher cannot
+    # run faster than that however it is configured.
+    if ($AfkPollInterval -lt $PollInterval) {
+        Write-Warning "-AfkPollInterval ${AfkPollInterval}s is shorter than -PollInterval ${PollInterval}s; AFK will be checked every ${PollInterval}s."
+    }
+
+    $connectionArgs = Select-AwConnectionArgs $PSBoundParameters
+    $context = New-AwWatcherContext @connectionArgs
+    try {
+        if (-not $BucketId)    { $BucketId    = "aw-watcher-window_$($context.Hostname)" }
+        if (-not $AfkBucketId) { $AfkBucketId = "aw-watcher-afk_$($context.Hostname)" }
+
+        Initialize-AwBucket -Context $context -BucketId $BucketId `
+            -Type 'currentwindow' -Client 'aw-watcher-window-powershell'
+        Initialize-AwBucket -Context $context -BucketId $AfkBucketId `
+            -Type 'afkstatus' -Client 'aw-watcher-afk-powershell'
+
+        $plan = @{
+            TickInterval = $PollInterval
+            Window       = @{
+                BucketId  = $BucketId
+                PulseTime = Format-AwInvariant ($PollInterval + 1.0)
+            }
+            # One extra PollInterval of pulse time, because the AFK tick is
+            # gated on the window loop and so can land up to one window poll
+            # late. Without it a late tick could fail to merge and split the
+            # event in two.
+            Afk          = New-AwAfkPlan -BucketId $AfkBucketId -Timeout $AfkTimeout `
+                -PollInterval $AfkPollInterval -PulseTime ($AfkTimeout + $AfkPollInterval + $PollInterval)
+        }
+
+        Write-Host "Watching active window and AFK status (timeout ${AfkTimeout}s). Press Ctrl+C to stop."
+        Invoke-AwWatcherLoop -Context $context -Plan $plan
+    }
+    finally {
+        Close-AwWatcherContext -Context $context
+    }
+}
+
+Write-Host "Loaded. Run: Start-AwWatcher       -Url http://localhost:5600  (window + AFK)"
+Write-Host "        or: Start-AwWatcherWindow -Url http://localhost:5600  (window only)"
+Write-Host "        or: Start-AwWatcherAfk    -Url http://localhost:5600  (AFK only)"
