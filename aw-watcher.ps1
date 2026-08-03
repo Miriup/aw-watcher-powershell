@@ -44,6 +44,63 @@ try {
     }
 }
 
+# Idle detection lives in its own class rather than in AwWatcher.Win32 above,
+# precisely because of the note there: a console that already pasted an older
+# version of this script cannot have members added to a class it already holds.
+# A never-before-published class name loads cleanly even in such a console.
+try {
+    Add-Type -Namespace AwWatcher -Name Idle -MemberDefinition @'
+        [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
+        private struct LASTINPUTINFO {
+            public uint cbSize;
+            public uint dwTime;
+        }
+
+        // Both the struct and the import must be private: a public method taking
+        // a private type is CS0051 (inconsistent accessibility).
+        [System.Runtime.InteropServices.DllImport("user32.dll", SetLastError = true)]
+        [return: System.Runtime.InteropServices.MarshalAs(System.Runtime.InteropServices.UnmanagedType.Bool)]
+        private static extern bool GetLastInputInfo(ref LASTINPUTINFO plii);
+
+        // Milliseconds since the last keyboard or mouse input in this session.
+        //
+        // Environment.TickCount and LASTINPUTINFO.dwTime share the same 32-bit
+        // GetTickCount base, which wraps every ~49.7 days. The subtraction is
+        // therefore done unchecked and UNSIGNED so the wrap cancels out; in
+        // signed arithmetic it would return a huge value once every 49.7 days
+        // and pin the machine as "afk" until the next reboot.
+        //
+        // TickCount64 is deliberately not used: it does not exist on the .NET
+        // Framework that Windows PowerShell 5.1 compiles this against. For the
+        // same reason this stays within C# 5 -- 5.1 uses the CodeDom compiler,
+        // where anything newer fails to compile even though PowerShell 7's
+        // Roslyn accepts it.
+        public static uint GetIdleMilliseconds() {
+            LASTINPUTINFO lii = new LASTINPUTINFO();
+            lii.cbSize = (uint) System.Runtime.InteropServices.Marshal.SizeOf(typeof(LASTINPUTINFO));
+            lii.dwTime = 0;
+            if (!GetLastInputInfo(ref lii)) {
+                // Not Win32Exception: System.ComponentModel is not guaranteed to
+                // be in Add-Type's default reference set on .NET Core.
+                throw new System.InvalidOperationException(
+                    "GetLastInputInfo failed with Win32 error " +
+                    System.Runtime.InteropServices.Marshal.GetLastWin32Error());
+            }
+            unchecked {
+                return ((uint) System.Environment.TickCount) - lii.dwTime;
+            }
+        }
+'@ -ErrorAction Stop
+} catch {
+    if ($_.Exception.Message -notmatch 'already exists') {
+        Write-Warning "Failed to load idle-time helper: $($_.Exception.Message)"
+    }
+}
+
+if (-not ('AwWatcher.Idle' -as [type])) {
+    Write-Warning 'AwWatcher.Idle is not available in this session, so AFK tracking will not work. Open a fresh PowerShell window and paste the script again.'
+}
+
 function Format-AwInvariant {
     # Every number that reaches a query string goes through here. A bare
     # $Value.ToString() is culture-sensitive and yields "2,5" under e.g. de-DE,
@@ -320,6 +377,72 @@ function Invoke-AwWindowTick {
         -Timestamp ([DateTime]::UtcNow) -Duration 0 -Data $data -Label 'Window'
 }
 
+function Get-AwIdleSeconds {
+    # Returns $null rather than throwing when the idle time cannot be read, so
+    # the caller can skip a tick without a try/catch. Being its own function
+    # also makes it the single seam to stub when testing the state machine.
+    try {
+        return [double]([AwWatcher.Idle]::GetIdleMilliseconds()) / 1000.0
+    } catch {
+        Write-Warning "Failed to read idle time: $($_.Exception.Message)"
+        return $null
+    }
+}
+
+function Invoke-AwAfkTick {
+    # One iteration of the AFK state machine, mirroring upstream aw-watcher-afk.
+    #
+    # Every heartbeat is stamped with the time of the LAST INPUT, not the time
+    # of detection. That is what makes an AFK block start where the user
+    # actually stopped typing instead of $Timeout seconds later, and it is what
+    # lets consecutive ticks merge into one event: the timestamp does not move
+    # while the user stays idle.
+    param([hashtable] $Context, [hashtable] $Afk)
+
+    $idleSeconds = Get-AwIdleSeconds
+    # Skip the tick entirely on a read failure. Guessing here would fabricate a
+    # transition that never happened.
+    if ($null -eq $idleSeconds) { return }
+
+    # Sample the clock once: calling UtcNow twice would land the two heartbeats
+    # of a transition on slightly different timestamps and break the seal.
+    $lastInput = [DateTime]::UtcNow.AddSeconds(-$idleSeconds)
+
+    $common = @{
+        Context   = $Context
+        BucketId  = $Afk.BucketId
+        PulseTime = $Afk.PulseTime
+        Timestamp = $lastInput
+        Label     = 'AFK'
+    }
+    $afkData    = @{ status = 'afk' }
+    $notAfkData = @{ status = 'not-afk' }
+
+    # The state flips whether or not the heartbeat reached the server. That is
+    # deliberate and self-healing: a lost "open" heartbeat is recreated by the
+    # next steady-state tick at the same timestamp with a longer duration,
+    # whereas retrying the transition would re-fire it forever.
+    if ($Afk.State.Afk -and $idleSeconds -lt $Afk.Timeout) {
+        # Input resumed: seal the afk period, then open not-afk.
+        Send-AwHeartbeat @common -Duration 0 -Data $afkData
+        $Afk.State.Afk = $false
+        Send-AwHeartbeat @common -Duration 0 -Data $notAfkData
+    }
+    elseif (-not $Afk.State.Afk -and $idleSeconds -ge $Afk.Timeout) {
+        # Gone idle long enough: seal not-afk, then open afk covering the
+        # whole idle span so far.
+        Send-AwHeartbeat @common -Duration 0 -Data $notAfkData
+        $Afk.State.Afk = $true
+        Send-AwHeartbeat @common -Duration $idleSeconds -Data $afkData
+    }
+    elseif ($Afk.State.Afk) {
+        Send-AwHeartbeat @common -Duration $idleSeconds -Data $afkData
+    }
+    else {
+        Send-AwHeartbeat @common -Duration 0 -Data $notAfkData
+    }
+}
+
 function Invoke-AwWatcherLoop {
     # One loop drives every watcher; a $null half of $Plan simply disables it.
     param([hashtable] $Context, [hashtable] $Plan)
@@ -329,9 +452,37 @@ function Invoke-AwWatcherLoop {
     # round to zero below 0.5, busy-looping. Sleep in milliseconds instead.
     $sleepMs = [int][Math]::Max(1, [Math]::Round($Plan.TickInterval * 1000))
 
+    # The AFK watcher usually ticks more slowly than the window watcher, so it
+    # is gated on a deadline instead of getting its own loop. Rebasing the
+    # deadline off the current time (rather than advancing it by a fixed step)
+    # means a laptop resuming from sleep does not fire a burst of catch-up
+    # ticks that would all read the same idle value. The cost is that the real
+    # AFK period can run up to one tick long, which the pulse time allows for.
+    $nextAfk = [DateTime]::UtcNow
+
     while ($true) {
         if ($Plan.Window) { Invoke-AwWindowTick -Context $Context -Window $Plan.Window }
+
+        if ($Plan.Afk -and [DateTime]::UtcNow -ge $nextAfk) {
+            Invoke-AwAfkTick -Context $Context -Afk $Plan.Afk
+            $nextAfk = [DateTime]::UtcNow.AddSeconds($Plan.Afk.PollInterval)
+        }
+
         Start-Sleep -Milliseconds $sleepMs
+    }
+}
+
+function New-AwAfkPlan {
+    # $State is a nested hashtable so Invoke-AwAfkTick can mutate it through
+    # the reference it is handed.
+    param([string] $BucketId, [double] $Timeout, [double] $PollInterval, [double] $PulseTime)
+
+    return @{
+        BucketId     = $BucketId
+        Timeout      = $Timeout
+        PollInterval = $PollInterval
+        PulseTime    = Format-AwInvariant $PulseTime
+        State        = @{ Afk = $false }
     }
 }
 
@@ -388,6 +539,68 @@ function Start-AwWatcherWindow {
         }
 
         Write-Host "Watching active window. Press Ctrl+C to stop."
+        Invoke-AwWatcherLoop -Context $context -Plan $plan
+    }
+    finally {
+        Close-AwWatcherContext -Context $context
+    }
+}
+
+function Start-AwWatcherAfk {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string] $Url,
+
+        [Parameter()]
+        [string] $CertificatePath,
+
+        [Parameter()]
+        [System.Security.SecureString] $CertificatePassword,
+
+        [Parameter()]
+        [ValidateRange(1.0, 86400.0)]
+        [double] $AfkTimeout = 180.0,
+
+        [Parameter()]
+        [ValidateRange(0.05, 3600.0)]
+        [double] $AfkPollInterval = 5.0,
+
+        [Parameter()]
+        [string] $AfkBucketId,
+
+        [Parameter()]
+        [switch] $SkipCertificateCheck,
+
+        [Parameter()]
+        [switch] $NoProxy,
+
+        [Parameter()]
+        [string] $Proxy,
+
+        [Parameter()]
+        [switch] $ProxyUseDefaultCredentials,
+
+        [Parameter()]
+        [System.Management.Automation.PSCredential] $ProxyCredential
+    )
+
+    $ErrorActionPreference = 'Stop'
+
+    $connectionArgs = Select-AwConnectionArgs $PSBoundParameters
+    $context = New-AwWatcherContext @connectionArgs
+    try {
+        if (-not $AfkBucketId) { $AfkBucketId = "aw-watcher-afk_$($context.Hostname)" }
+        Initialize-AwBucket -Context $context -BucketId $AfkBucketId `
+            -Type 'afkstatus' -Client 'aw-watcher-afk-powershell'
+
+        $plan = @{
+            TickInterval = $AfkPollInterval
+            Afk          = New-AwAfkPlan -BucketId $AfkBucketId -Timeout $AfkTimeout `
+                -PollInterval $AfkPollInterval -PulseTime ($AfkTimeout + $AfkPollInterval)
+        }
+
+        Write-Host "Watching AFK status (timeout ${AfkTimeout}s). Press Ctrl+C to stop."
         Invoke-AwWatcherLoop -Context $context -Plan $plan
     }
     finally {
